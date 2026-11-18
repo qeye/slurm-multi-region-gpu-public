@@ -14,7 +14,7 @@ Lustre or custom-image pieces.
 | /lustre | Managed Lustre 18 TiB | removed |
 | /gcs | Multi-region HNS bucket | same |
 | Controller / login | n2-standard-16 / n2-standard-4 | n2-standard-4 / n2-standard-2 |
-| Spot | always | off by default (`use_spot: true` to turn it on) |
+| Spot | always | on by default (`use_spot: false` to turn it off) |
 
 ## Files
 
