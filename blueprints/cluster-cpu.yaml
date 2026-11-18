@@ -1,0 +1,370 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# CPU-only proof-of-concept variant of blueprints/cluster.yaml.
+#
+# Same multi-region shape as the GPU reference (one Slurm cluster, one
+# partition, nodesets fanned across CONUS regions on the default VPC with
+# GLOBAL routing, ordered by Slurm Weight), with everything GPU-specific
+# removed so it can be stood up cheaply and quickly:
+#
+#   * Compute: c3-standard-4 (4 vCPU / 16 GB) in 4 regions —
+#       us-central1 (W1, in-region with controller), us-east4 (W2),
+#       us-west1 (W3), us-east5 (W4). All four are in the NAT_REGIONS list
+#       of scripts/setup-project.sh, so that script works unchanged.
+#   * Image: SchedMD's public slurm-gcp-6-12-hpc-rocky-linux-8 (the Toolkit
+#       v1.90.0 default). No Packer build — build-lustre-image.yaml is NOT
+#       needed for this blueprint.
+#   * Removed: RDMA VPC, Managed Lustre (+ private service access),
+#       Filestore, NVIDIA/a3 node_conf, local-SSD mount, Calendar/Flex hooks.
+#   * /home and /opt/apps: NFS-exported from the controller (slurm-gcp
+#       default when no /home network_storage is given). Fine for a PoC; add
+#       Filestore back for anything real (see commented block below).
+#   * /gcs: multi-region US bucket (HNS) via Cloud Storage FUSE — kept,
+#       because it is cheap and is the cross-region checkpoint tier.
+#   * Secure Boot re-enabled: it was only disabled for the unsigned Lustre
+#       kernel module, which this blueprint doesn't use.
+#
+# Deploy:
+#   ./scripts/setup-project.sh          # same bootstrap as the GPU cluster
+#   gcluster deploy blueprints/cluster-cpu.yaml \
+#       -d blueprints/cluster-cpu-deployment.yaml --auto-approve
+#
+# Gotchas carried over from the GPU blueprint:
+#   * Default VPC must be GLOBAL routing + VmDnsSetting=GlobalOnly
+#     (setup-project.sh does both) so cross-region slurmd can reach slurmctld.
+#   * Each nodeset sets `zone:` explicitly; `zones:` adds same-region zones.
+#   * C3 doesn't support pd-standard boot disks (the nodeset module default),
+#     so disk_type is set to pd-balanced everywhere.
+
+---
+blueprint_name: slurm-cpu-poc
+
+# Cross-region nodesets would otherwise trip the "machine type in the
+# deployment's default zone" check.
+validators:
+- validator: test_machine_type_in_zone
+  skip: true
+
+vars:
+  deployment_name: slurm-cpu-poc
+  project_id: YOUR_PROJECT_ID   # overridden by cluster-cpu-deployment.yaml / --vars
+  region: us-central1
+  zone: us-central1-a
+
+  # Public SchedMD image — CPU only, no custom build needed.
+  instance_image:
+    project: schedmd-slurm-public
+    family: slurm-gcp-6-12-hpc-rocky-linux-8
+
+  compute_machine_type: c3-standard-4
+  compute_disk_type: pd-balanced      # C3 supports pd-balanced / pd-ssd / hyperdisk-*
+  disk_size_gb: 50
+
+  nodes_per_region: 2   # max dynamic nodes per regional nodeset
+  use_spot: true        # set true to mirror the GPU cluster's Spot fan-out
+
+deployment_groups:
+
+# -----------------------------------------------------------------------------
+# cluster-env: per-region default-VPC references + GCS bucket
+# -----------------------------------------------------------------------------
+- group: cluster-env
+  modules:
+
+  - id: default_vpc_central
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-central1
+
+  - id: default_vpc_east4
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-east4
+
+  - id: default_vpc_west1
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-west1
+
+  - id: default_vpc_east5
+    source: modules/network/pre-existing-vpc
+    settings:
+      network_name: default
+      subnetwork_name: default
+      region: us-east5
+
+  # Optional: dedicated /home on Filestore instead of the controller's NFS
+  # export. Uncomment, then add `homefs` to slurm_controller.use below.
+  # BASIC_HDD 1 TiB is the cheapest tier.
+  #
+  # - id: homefs
+  #   source: modules/file-system/filestore
+  #   use: [default_vpc_central]
+  #   settings:
+  #     filestore_tier: BASIC_HDD
+  #     size_gb: 1024
+  #     local_mount: /home
+  #     deletion_protection:
+  #       enabled: false
+  #   outputs:
+  #   - network_storage
+
+  # Multi-region US bucket with HNS, mounted at /gcs on every node. Reachable
+  # from every compute region, so it's the place for job output/checkpoints.
+  - id: gcs_bucket
+    source: modules/file-system/cloud-storage-bucket
+    settings:
+      region: US
+      storage_class: STANDARD
+      enable_hierarchical_namespace: true
+      local_mount: /gcs
+      random_suffix: true
+      force_destroy: true   # PoC: let `gcluster destroy` remove a non-empty bucket
+      mount_options: "implicit_dirs,\
+                      metadata_cache_negative_ttl_secs=0,\
+                      metadata_cache_ttl_secs=-1,\
+                      stat_cache_max_size_mb=-1,\
+                      type_cache_max_size_mb=-1,\
+                      dir_mode=777,\
+                      file_mode=777,\
+                      allow_other"
+
+# -----------------------------------------------------------------------------
+# cluster: controller, login, nodesets, partition
+# -----------------------------------------------------------------------------
+- group: cluster
+  modules:
+
+  # Same controller /etc/hosts fallback as the GPU blueprint: cross-region
+  # compute nodes NFS-mount /home and /opt/apps from the controller by short
+  # hostname. VmDnsSetting=GlobalOnly normally covers this; the runner is a
+  # non-fatal belt-and-braces.
+  - id: compute_startup
+    source: modules/scripts/startup-script
+    settings:
+      runners:
+      - type: shell
+        destination: add_controller_hosts_entry.sh
+        content: |
+          #!/bin/bash
+          CTRL=""
+          for _ in 1 2 3 4 5; do
+            CTRL=\$(awk -F= '/^SlurmctldHost/ { sub(/\(.*$/, "", $2); gsub(/[[:space:]]/, "", $2); print $2; exit }' /usr/local/etc/slurm/slurm.conf 2>/dev/null)
+            [ -n "$CTRL" ] && break
+            sleep 2
+          done
+          if [ -z "$CTRL" ]; then
+            echo "WARN: SlurmctldHost not readable after 10s - skipping /etc/hosts entry (GlobalOnly DNS still in effect)" >&2
+            exit 0
+          fi
+          PROJECT=\$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/project-id)
+          IP=\$(gcloud compute instances list --project="$PROJECT" --filter="name=$CTRL" \
+                  --format='value(networkInterfaces[0].networkIP)' 2>/dev/null | head -1) || true
+          if [ -n "$IP" ]; then
+            sed -i "/[[:space:]]${CTRL}\$/d" /etc/hosts
+            echo "$IP $CTRL" >> /etc/hosts
+            echo "$CTRL -> $IP added to /etc/hosts"
+          else
+            echo "WARN: no IP found for $CTRL; relying on VmDnsSetting=GlobalOnly DNS" >&2
+          fi
+          exit 0
+
+  # =========================================================================
+  # c3-standard-4 fan-out — 4 regions, ordered by node_conf.Weight
+  # (lower = preferred). Each nodeset also gets a region Feature so a job can
+  # be pinned with e.g. `sbatch --constraint=useast4`.
+  # =========================================================================
+
+  # W1 — us-central1 (same region as controller, login, /home)
+  - id: c3_central1
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_central, compute_startup]
+    settings:
+      machine_type: $(vars.compute_machine_type)
+      region: us-central1
+      zone: us-central1-a
+      zones: [us-central1-b, us-central1-c]
+      bandwidth_tier: gvnic_enabled
+      disk_type: $(vars.compute_disk_type)
+      disk_size_gb: $(vars.disk_size_gb)
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: true
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: $(vars.nodes_per_region)
+      enable_placement: false
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: $(vars.use_spot)
+        #      spot_instance_config:
+        #termination_action: STOP
+      node_conf:
+        Feature: c3,uscentral1
+        Weight: 1
+
+  # W2 — us-east4
+  - id: c3_east4
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_east4, compute_startup]
+    settings:
+      machine_type: $(vars.compute_machine_type)
+      region: us-east4
+      zone: us-east4-a
+      zones: [us-east4-b, us-east4-c]
+      bandwidth_tier: gvnic_enabled
+      disk_type: $(vars.compute_disk_type)
+      disk_size_gb: $(vars.disk_size_gb)
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: true
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: $(vars.nodes_per_region)
+      enable_placement: false
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: $(vars.use_spot)
+        #spot_instance_config:
+        #termination_action: STOP
+      node_conf:
+        Feature: c3,useast4
+        Weight: 2
+
+  # W3 — us-west1
+  - id: c3_west1
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_west1, compute_startup]
+    settings:
+      machine_type: $(vars.compute_machine_type)
+      region: us-west1
+      zone: us-west1-a
+      zones: [us-west1-b, us-west1-c]
+      bandwidth_tier: gvnic_enabled
+      disk_type: $(vars.compute_disk_type)
+      disk_size_gb: $(vars.disk_size_gb)
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: true
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: $(vars.nodes_per_region)
+      enable_placement: false
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: $(vars.use_spot)
+        #spot_instance_config:
+        #termination_action: STOP
+      node_conf:
+        Feature: c3,uswest1
+        Weight: 3
+
+  # W4 — us-east5
+  - id: c3_east5
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [default_vpc_east5, compute_startup]
+    settings:
+      machine_type: $(vars.compute_machine_type)
+      region: us-east5
+      zone: us-east5-a
+      zones: [us-east5-b, us-east5-c]
+      bandwidth_tier: gvnic_enabled
+      disk_type: $(vars.compute_disk_type)
+      disk_size_gb: $(vars.disk_size_gb)
+      enable_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: true
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+      node_count_static: 0
+      node_count_dynamic_max: $(vars.nodes_per_region)
+      enable_placement: false
+      on_host_maintenance: TERMINATE
+      enable_spot_vm: $(vars.use_spot)
+        #spot_instance_config:
+        #termination_action: STOP
+      node_conf:
+        Feature: c3,useast5
+        Weight: 4
+
+  # =========================================================================
+  # Single partition `cpu`. `sbatch -p cpu job.sh` lands on the lowest-Weight
+  # nodeset with capacity; `--constraint=<region feature>` pins a region.
+  # =========================================================================
+  - id: cpu_partition
+    source: community/modules/compute/schedmd-slurm-gcp-v6-partition
+    use:
+    - c3_central1   # W1
+    - c3_east4      # W2
+    - c3_west1      # W3
+    - c3_east5      # W4
+    settings:
+      exclusive: false
+      partition_name: cpu
+      is_default: true
+      partition_conf:
+        OverSubscribe: EXCLUSIVE
+        ResumeTimeout: 600    # c3 + public image boots in a few minutes
+        SuspendTimeout: 600
+
+  - id: slurm_login
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-login
+    use: [default_vpc_central]
+    settings:
+      machine_type: n2-standard-2
+      disk_type: pd-balanced
+      disk_size_gb: $(vars.disk_size_gb)
+      enable_login_public_ips: false
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: true
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true
+
+  - id: slurm_controller
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-controller
+    use:
+    - default_vpc_central
+    - cpu_partition
+    - slurm_login
+    - gcs_bucket
+    # - homefs   # uncomment together with the Filestore block above
+    settings:
+      machine_type: n2-standard-4
+      disk_type: pd-ssd
+      disk_size_gb: $(vars.disk_size_gb)
+      enable_controller_public_ips: false
+      enable_external_prolog_epilog: true
+      enable_shielded_vm: true
+      shielded_instance_config:
+        enable_secure_boot: true
+        enable_vtpm: true
+        enable_integrity_monitoring: true
+      enable_oslogin: true

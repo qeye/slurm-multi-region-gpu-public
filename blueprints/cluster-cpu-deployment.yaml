@@ -1,0 +1,18 @@
+# Copyright 2026 Google LLC.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Per-deployment vars for the CPU-only PoC (blueprints/cluster-cpu.yaml).
+# Usage:
+#   gcluster deploy blueprints/cluster-cpu.yaml \
+#       -d blueprints/cluster-cpu-deployment.yaml \
+#       --vars project_id=$PROJECT_ID --auto-approve
+
+vars:
+  deployment_name: slurm-cpu-poc
+  project_id: YOUR_PROJECT_ID
+  region: us-central1
+  zone: us-central1-a
+  # 2 x c3-standard-4 per region, 4 regions = up to 8 nodes / 32 vCPU
+  nodes_per_region: 2
+  use_spot: false
